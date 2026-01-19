@@ -11,6 +11,34 @@ import { PromiseReturnType } from "./install-deps";
 
 const execAsync = promisify(exec);
 
+// Wrapper for execAsync with timeout
+async function execAsyncWithTimeout(
+    command: string,
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number }
+): Promise<{ stdout: string; stderr: string }> {
+    const timeout = options?.timeout || 30000; // Default 30 seconds
+    const { cwd, env } = options || {};
+
+    return new Promise((resolve, reject) => {
+        const childProcess = exec(command, { cwd, env }, (error, stdout, stderr) => {
+            if (error) {
+                reject(error);
+            } else {
+                resolve({ stdout, stderr });
+            }
+        });
+
+        const timeoutId = setTimeout(() => {
+            childProcess.kill();
+            reject(new Error(`Command timeout after ${timeout}ms: ${command}`));
+        }, timeout);
+
+        childProcess.on('exit', () => {
+            clearTimeout(timeoutId);
+        });
+    });
+}
+
 // helper function to get main window
 export function getMainWindow(): BrowserWindow | null {
     const windows = BrowserWindow.getAllWindows();
@@ -87,7 +115,7 @@ export async function checkToolInstalled() {
 //         })
 
 //         node_process.on('close', async (code) => {
-//             // delete installing lock file 
+//             // delete installing lock file
 //             if (fs.existsSync(installingLockPath)) {
 //                 fs.unlinkSync(installingLockPath)
 //             }
@@ -194,13 +222,33 @@ export async function startBackend(setPort?: (port: number) => void): Promise<an
         log.info(`Backend working directory: ${backendPath}`);
         log.info(`Using venv: ${venvPath}`);
 
+        // Check if in China and prepare environment for mirror
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const isInChina = timezone === 'Asia/Shanghai';
+
+        // Prepare environment with mirror if in China
+        const testEnv = {
+            ...env,
+            ...(isInChina ? {
+                UV_INDEX_URL: 'https://mirrors.aliyun.com/pypi/simple/',
+                PIP_INDEX_URL: 'https://mirrors.aliyun.com/pypi/simple/'
+            } : {})
+        };
+
         try {
-            const { stdout: uvVersion } = await execAsync(`${uv_path} --version`);
+            log.info(`Starting pre-flight check (timeout: 30s)...`);
+            log.info(`Timezone: ${timezone}, Using mirror: ${isInChina ? 'Yes (Aliyun)' : 'No'}`);
+
+            const { stdout: uvVersion } = await execAsyncWithTimeout(
+                `${uv_path} --version`,
+                { timeout: 10000 } // 10 seconds for version check
+            );
             log.info(`UV version check: ${uvVersion.trim()}`);
 
-            const { stdout: pythonTest } = await execAsync(
+            log.info(`Testing Python with uv run...`);
+            const { stdout: pythonTest } = await execAsyncWithTimeout(
                 `${uv_path} run python -c "print('Python OK')"`,
-                { cwd: backendPath, env: env }
+                { cwd: backendPath, env: testEnv, timeout: 30000 } // 30 seconds for Python test
             );
             log.info(`Python test output: ${pythonTest.trim()}`);
         } catch (testErr: any) {
@@ -225,52 +273,124 @@ export async function startBackend(setPort?: (port: number) => void): Promise<an
                     log.warn(`Failed to remove lock file: ${e}`);
                 }
 
-                // Cleanup corrupted python cache
-                try {
-                    const pythonCacheDir = getCachePath('uv_python');
-                    if (fs.existsSync(pythonCacheDir)) {
-                        log.info(`Removing potentially corrupted Python cache: ${pythonCacheDir}`);
-                        fs.rmSync(pythonCacheDir, { recursive: true, force: true });
+                // First, try to fix pyvenv.cfg if it has hardcoded paths (Windows issue)
+                // This is a common problem when venv is pre-built on a different machine
+                let pyvenvCfgFixed = false;
+                if (process.platform === 'win32' && fs.existsSync(venvPath)) {
+                    const pyvenvCfgPath = path.join(venvPath, 'pyvenv.cfg');
+                    if (fs.existsSync(pyvenvCfgPath)) {
+                        try {
+                            log.info("Attempting to fix pyvenv.cfg with hardcoded paths...");
+                            let content = fs.readFileSync(pyvenvCfgPath, 'utf-8');
+                            const lines = content.split('\n');
+                            const newLines = [];
+                            let modified = false;
+
+                            for (const line of lines) {
+                                // Remove 'home' line that contains absolute path (Windows drive letter)
+                                // This allows uv to auto-discover Python at runtime
+                                if (line.trim().startsWith('home =')) {
+                                    const match = line.match(/home\s*=\s*(.+)/);
+                                    if (match && match[1].trim().match(/^[A-Za-z]:/)) {
+                                        log.info(`  Removing hardcoded Python path: ${match[1].trim()}`);
+                                        modified = true;
+                                        continue; // Skip this line
+                                    }
+                                }
+                                newLines.push(line);
+                            }
+
+                            if (modified) {
+                                fs.writeFileSync(pyvenvCfgPath, newLines.join('\n'), 'utf-8');
+                                log.info("✅ Fixed pyvenv.cfg, retrying Python check...");
+
+                                // Retry the Python check after fixing pyvenv.cfg
+                                try {
+                                    const { stdout: pythonTestAfterFix } = await execAsyncWithTimeout(
+                                        `${uv_path} run python -c "print('Python OK')"`,
+                                        { cwd: backendPath, env: testEnv, timeout: 30000 }
+                                    );
+                                    log.info(`Python test output after pyvenv.cfg fix: ${pythonTestAfterFix.trim()}`);
+                                    // Success! No need for full repair
+                                    pyvenvCfgFixed = true;
+                                } catch (retryErr) {
+                                    log.warn(`Python check still failed after pyvenv.cfg fix: ${retryErr}`);
+                                    // Continue with full repair
+                                }
+                            }
+                        } catch (e) {
+                            log.warn(`Failed to fix pyvenv.cfg: ${e}`);
+                        }
                     }
-                } catch (e) {
-                    log.warn(`Failed to remove Python cache: ${e}`);
                 }
 
-                // Cleanup corrupted venv (pyvenv.cfg may reference non-existent Python version)
-                try {
-                    if (fs.existsSync(venvPath)) {
-                        log.info(`Removing potentially corrupted venv: ${venvPath}`);
-                        fs.rmSync(venvPath, { recursive: true, force: true });
+                // If pyvenv.cfg fix didn't work, do full repair (reinstall Python and dependencies)
+                if (!pyvenvCfgFixed) {
+                    // Cleanup corrupted python cache
+                    try {
+                        const pythonCacheDir = getCachePath('uv_python');
+                        if (fs.existsSync(pythonCacheDir)) {
+                            log.info(`Removing potentially corrupted Python cache: ${pythonCacheDir}`);
+                            fs.rmSync(pythonCacheDir, { recursive: true, force: true });
+                        }
+                    } catch (e) {
+                        log.warn(`Failed to remove Python cache: ${e}`);
                     }
-                } catch (e) {
-                    log.warn(`Failed to remove venv: ${e}`);
+
+                    // Cleanup corrupted venv (pyvenv.cfg may reference non-existent Python version)
+                    try {
+                        if (fs.existsSync(venvPath)) {
+                            log.info(`Removing potentially corrupted venv: ${venvPath}`);
+                            fs.rmSync(venvPath, { recursive: true, force: true });
+                        }
+                    } catch (e) {
+                        log.warn(`Failed to remove venv: ${e}`);
+                    }
+
+                    // Use proxy if in China (simple check based on timezone)
+                    // Add official PyPI as fallback for packages not available on mirror
+                    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    const isInChinaRepair = timezone === 'Asia/Shanghai';
+                    const proxyArgs = isInChinaRepair
+                        ? [
+                            '--default-index', 'https://mirrors.aliyun.com/pypi/simple/',
+                            '--index', 'https://pypi.org/simple/'
+                        ]
+                        : [];
+
+                    // Prepare environment with mirror for repair operations
+                    const repairEnv = {
+                        ...env,
+                        ...(isInChinaRepair ? {
+                            UV_INDEX_URL: 'https://mirrors.aliyun.com/pypi/simple/',
+                            PIP_INDEX_URL: 'https://mirrors.aliyun.com/pypi/simple/',
+                            UV_PYTHON_INSTALL_MIRROR: 'https://registry.npmmirror.com/-/binary/python-build-standalone'
+                        } : {})
+                    };
+
+                    // Step 1: Ensure Python is installed (fixes corrupted/missing Python)
+                    log.info("Step 1: Ensuring Python is installed (this may take a while, timeout: 5min)...");
+                    await execAsyncWithTimeout(
+                        `${uv_path} python install 3.10`,
+                        { cwd: backendPath, env: repairEnv, timeout: 300000 } // 5 minutes
+                    );
+
+                    // Step 2: Sync dependencies
+                    log.info("Step 2: Syncing dependencies (this may take a while, timeout: 10min)...");
+                    const syncArgs = ['sync', '--no-dev', ...proxyArgs];
+                    await execAsyncWithTimeout(
+                        `${uv_path} ${syncArgs.join(' ')}`,
+                        { cwd: backendPath, env: repairEnv, timeout: 600000 } // 10 minutes
+                    );
+
+                    // Retry the check
+                    log.info("Step 3: Verifying Python after repair...");
+                    const { stdout: pythonTest } = await execAsyncWithTimeout(
+                        `${uv_path} run python -c "print('Python OK')"`,
+                        { cwd: backendPath, env: testEnv, timeout: 30000 }
+                    );
+                    log.info(`Python test output after repair: ${pythonTest.trim()}`);
                 }
-
-                // Use proxy if in China (simple check based on timezone)
-                // Add official PyPI as fallback for packages not available on mirror
-                const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                const proxyArgs = timezone === 'Asia/Shanghai'
-                    ? [
-                        '--default-index', 'https://mirrors.aliyun.com/pypi/simple/',
-                        '--index', 'https://pypi.org/simple/'
-                    ]
-                    : [];
-
-                // Step 1: Ensure Python is installed (fixes corrupted/missing Python)
-                log.info("Step 1: Ensuring Python is installed...");
-                await execAsync(`${uv_path} python install 3.10`, { cwd: backendPath, env: env });
-
-                // Step 2: Sync dependencies
-                log.info("Step 2: Syncing dependencies...");
-                const syncArgs = ['sync', '--no-dev', ...proxyArgs];
-                await execAsync(`${uv_path} ${syncArgs.join(' ')}`, { cwd: backendPath, env: env });
-
-                // Retry the check
-                const { stdout: pythonTest } = await execAsync(
-                    `${uv_path} run python -c "print('Python OK')"`,
-                    { cwd: backendPath, env: env }
-                );
-                log.info(`Python test output after repair: ${pythonTest.trim()}`);
             } catch (repairErr) {
                 log.error(`Repair failed: ${repairErr}`);
                 reject(new Error(`Backend environment check failed: ${testErr}\nRepair failed: ${repairErr}`));
