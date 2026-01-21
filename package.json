@@ -117,7 +117,7 @@
     "@vitejs/plugin-react": "^4.3.3",
     "@vitest/coverage-v8": "^2.1.9",
     "autoprefixer": "^10.4.20",
-    "electron": "^33.4.11",
+    "electron": "^40.0.0",
     "electron-builder": "^26.4.0",
     "electron-devtools-installer": "^4.0.0",
     "i18next": "^25.4.2",
